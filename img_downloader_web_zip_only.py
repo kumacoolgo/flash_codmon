@@ -11,7 +11,7 @@ img_downloader_web_zip_only.py
 - 文件下载逻辑与原版一致：
   - 前端粘贴多行 URL
   - 后端为每个任务生成 UUID task_id
-  - 每张图片下载 + 打包 ZIP（按最终文件名去重，同名只保留第一张）
+  - 每张图片下载 + 打包 ZIP
   - 提供 SSE 进度 /progress/<task_id>
   - 提供下载 /download_final/<task_id>
 """
@@ -64,6 +64,7 @@ progress_queues = {}
 
 # ====== 辅助函数 ======
 _filename_sanitize_re = re.compile(r'[^A-Za-z0-9._\-]')
+SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'}
 
 def sanitize_filename(name: str, max_len: int = 200) -> str:
     """将文件名中不安全字符替换为下划线，并限制长度。"""
@@ -84,8 +85,9 @@ def extract_filename_from_url(url: str) -> str:
     规则：
     - 忽略 ? 后面的签名参数
     - 从 path 中取最后一段文件名
-    - 例如只截取 A7V08093.jpg
-    - 若没有扩展名则追加 .jpg
+    - 支持 .jpg / .jpeg / .png / .webp / .gif / .bmp / .heic / .heif
+    - 例如只截取 A7V08093.jpg、A7V08093.jpeg、A7V08093.png
+    - 若没有图片扩展名则追加 .jpg
     - 最后做安全字符过滤
     """
     try:
@@ -100,10 +102,17 @@ def extract_filename_from_url(url: str) -> str:
         if not basename:
             basename = "file.jpg"
 
-        # 处理被 URL 编码的文件名
+        # 处理被 URL 编码的文件名，例如 A7V08093%2Ejpeg
         basename = urllib.parse.unquote(basename)
 
-        if "." not in basename:
+        stem, ext = os.path.splitext(basename)
+        ext_lower = ext.lower()
+
+        # 有些链接可能是 .JPEG / .PNG，大写扩展名也保留原名；
+        # 如果没有图片扩展名，则默认补 .jpg。
+        if not stem:
+            basename = "file.jpg"
+        elif ext_lower not in SUPPORTED_IMAGE_EXTENSIONS:
             basename = basename + ".jpg"
 
         return sanitize_filename(basename)
@@ -197,19 +206,18 @@ def download_worker(urls, q: queue.Queue, task_id: str):
     items = []  # 每个元素: {"name": filename, "status": "...", "progress": 0..100}
     zip_buffer = BytesIO()
 
-    seen_filenames = set()
-
     with ZipFile(zip_buffer, "w") as zf:
         for i, url in enumerate(urls, start=1):
             filename = extract_filename_from_url(url)
+            # 如果有重复名字，添加序号避免覆盖
+            base, ext = os.path.splitext(filename)
+            unique_name = filename
+            suffix = 1
+            while any(it["name"] == unique_name for it in items):
+                unique_name = f"{base}_{suffix}{ext}"
+                suffix += 1
 
-            # 按最终文件名去重：
-            # 例如 A7V08093.jpg 出现多次，只下载/打包第一张，不再生成 A7V08093_1.jpg。
-            if filename in seen_filenames:
-                continue
-            seen_filenames.add(filename)
-
-            item = {"name": filename, "status": "下载中", "progress": 0}
+            item = {"name": unique_name, "status": "下载中", "progress": 0}
             items.append(item)
             q.put({"items": items.copy(), "done": False})
 
@@ -234,8 +242,8 @@ def download_worker(urls, q: queue.Queue, task_id: str):
 
                     content_bytes = b"".join(chunks)
 
-                # 写入 ZIP（使用去重后的原始文件名）
-                zf.writestr(filename, content_bytes)
+                # 写入 ZIP（使用 unique_name）
+                zf.writestr(unique_name, content_bytes)
                 item["status"] = "完成"
                 item["progress"] = 100
                 q.put({"items": items.copy(), "done": False})
@@ -343,10 +351,12 @@ button:hover{background:#0069d9}
     <a href="/logout">退出登录</a>
   </div>
   <p><a href="https://parents.codmon.com/site/organizations" target="_blank" rel="noopener noreferrer">parents.codmon.com</a></p>
-  <p>粘贴图片 URL（每行一个），点击“开始下载”。文件名自动从 URL 提取（例如 <code>A7V08093.jpg</code>）。同名文件会自动去重，只保留第一张。</p>
+  <p>粘贴图片 URL（每行一个），点击“开始下载”。文件名自动从 URL 提取（例如 <code>A7V08093.jpg</code>）。</p>
 
   <label for="urls">图片 URL（每行一个）</label>
-  <textarea id="urls" rows="10" placeholder="https://image.codmon.com/codmon/13774/albums/A7V08093.jpg?Policy=..."></textarea>
+  <textarea id="urls" rows="10" placeholder="https://image.codmon.com/codmon/13774/albums/A7V08093.jpg?Policy=...
+https://image.codmon.com/codmon/13774/albums/A7V08094.jpeg?Policy=...
+https://image.codmon.com/codmon/13774/albums/A7V08095.png?Policy=..."></textarea>
 
   <button id="startBtn">开始下载</button>
 
