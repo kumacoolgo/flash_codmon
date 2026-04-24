@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-img_downloader_web_zip_only.py
+img_downloader_codmon_zip.py
 
 说明:
 - 访问 /login 登录后，才能使用下载页面（/）。
-- 账号密码从环境变量读取：
-  - APP_USERNAME
-  - APP_PASSWORD
-- 文件下载逻辑与原版一致：
-  - 前端粘贴多行 URL
-  - 后端为每个任务生成 UUID task_id
-  - 每张图片下载 + 打包 ZIP
-  - 提供 SSE 进度 /progress/<task_id>
-  - 提供下载 /download_final/<task_id>
+- 账号密码从环境变量读取：APP_USERNAME / APP_PASSWORD。
+- 适配 Codmon 图片链接：https://image.codmon.com/...
+- 文件名从 URL path 最后一段提取，支持 .jpg / .jpeg / .png / .webp / .gif / .bmp / .heic / .heif。
+- 按最终文件名去重：同名只保留第一张，不生成 _1、_2。
+- 进度写入磁盘 JSON，避免 Zeabur/Gunicorn 多 worker 时 SSE 出现 task not found。
 """
 
 import os
@@ -21,7 +17,6 @@ import re
 import time
 import uuid
 import json
-import queue
 import threading
 import urllib.parse
 from io import BytesIO
@@ -41,102 +36,135 @@ from flask import (
 )
 
 # ====== 配置 ======
-# 临时 zip 存放目录，可以用环境变量 TMP_DIR 覆盖（在 Zeabur 上可以挂到 /data/tmp_zip）
 TMP_DIR = os.environ.get("TMP_DIR", "tmp_zip")
-ZIP_TTL_SECONDS = 3600       # ZIP 存放时间（秒），超过将被后台清理
-CLEANUP_INTERVAL = 600       # 清理线程间隔（秒）
-DOWNLOAD_TIMEOUT = 20        # requests 超时时间（秒）
-CHUNK_SIZE = 1024            # 下载分块大小（字节）
+PROGRESS_DIR = os.path.join(TMP_DIR, "progress")
+ZIP_TTL_SECONDS = int(os.environ.get("ZIP_TTL_SECONDS", "3600"))
+CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "600"))
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "20"))
+CHUNK_SIZE = 1024
 
-# 登录账号密码（在 Zeabur 环境变量设置）
 APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "password")
 
 os.makedirs(TMP_DIR, exist_ok=True)
+os.makedirs(PROGRESS_DIR, exist_ok=True)
 
 app = Flask(__name__)
-
-# Flask session 加密密钥，务必在 Zeabur 上设置 SECRET_KEY
 app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_ME_SECRET_KEY")
 
-# task_id -> queue.Queue()（用于 SSE 推送进度）
-progress_queues = {}
+# ====== 文件名处理 ======
+# 只替换路径分隔符、控制字符和 Windows 不允许的字符；保留中文/日文。
+_filename_sanitize_re = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"}
 
-# ====== 辅助函数 ======
-_filename_sanitize_re = re.compile(r'[^A-Za-z0-9._\-]')
-SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'}
 
 def sanitize_filename(name: str, max_len: int = 200) -> str:
-    """将文件名中不安全字符替换为下划线，并限制长度。"""
     if not name:
-        name = "file"
-    name = _filename_sanitize_re.sub("_", name)
+        name = "file.jpg"
+    name = urllib.parse.unquote(name)
+    name = _filename_sanitize_re.sub("_", name).strip().strip(".")
+    if not name:
+        name = "file.jpg"
     if len(name) > max_len:
-        name = name[:max_len]
+        stem, ext = os.path.splitext(name)
+        keep = max_len - len(ext)
+        name = stem[:max(1, keep)] + ext
     return name
+
 
 def extract_filename_from_url(url: str) -> str:
     """
-    从图片 URL 中提取文件名。
+    从 Codmon 图片 URL 提取最终文件名。
 
-    适配 Codmon 这种格式：
-    https://image.codmon.com/codmon/13774/albums/A7V08093.jpg?Policy=...&width=500...
+    例：
+    https://image.codmon.com/codmon/13774/albums/A7V08093.jpg?Policy=...
+    -> A7V08093.jpg
 
-    规则：
-    - 忽略 ? 后面的签名参数
-    - 从 path 中取最后一段文件名
-    - 支持 .jpg / .jpeg / .png / .webp / .gif / .bmp / .heic / .heif
-    - 例如只截取 A7V08093.jpg、A7V08093.jpeg、A7V08093.png
-    - 若没有图片扩展名则追加 .jpg
-    - 最后做安全字符过滤
+    https://image.codmon.com/codmon/13774/documentations/113598/128361306-IMG_6495.jpeg?Policy=...
+    -> 128361306-IMG_6495.jpeg
     """
     try:
-        parsed = urllib.parse.urlparse(url.strip())
+        raw_url = (url or "").strip()
+        parsed = urllib.parse.urlparse(raw_url)
         basename = os.path.basename(parsed.path) or ""
 
-        # 极端情况下，如果用户粘贴的 URL 没有被正常解析，再手动去 query 后取最后一段
         if not basename:
-            clean = url.split("?", 1)[0]
+            clean = raw_url.split("?", 1)[0]
             basename = clean.rstrip("/").split("/")[-1]
 
-        if not basename:
-            basename = "file.jpg"
-
-        # 处理被 URL 编码的文件名，例如 A7V08093%2Ejpeg
-        basename = urllib.parse.unquote(basename)
-
+        basename = urllib.parse.unquote(basename or "file.jpg")
         stem, ext = os.path.splitext(basename)
-        ext_lower = ext.lower()
 
-        # 有些链接可能是 .JPEG / .PNG，大写扩展名也保留原名；
-        # 如果没有图片扩展名，则默认补 .jpg。
         if not stem:
             basename = "file.jpg"
-        elif ext_lower not in SUPPORTED_IMAGE_EXTENSIONS:
+        elif ext.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
             basename = basename + ".jpg"
 
         return sanitize_filename(basename)
     except Exception:
-        return sanitize_filename("file.jpg")
+        return "file.jpg"
+
+
+def dedupe_urls_by_filename(urls):
+    """按最终文件名去重：同名只保留第一次出现的 URL。"""
+    seen = set()
+    unique_urls = []
+    skipped_names = []
+
+    for url in urls:
+        filename = extract_filename_from_url(url)
+        key = filename.lower()
+        if key in seen:
+            skipped_names.append(filename)
+            continue
+        seen.add(key)
+        unique_urls.append(url)
+
+    return unique_urls, skipped_names
+
+
+# ====== 磁盘进度 ======
+def progress_file_path(task_id: str) -> str:
+    return os.path.join(PROGRESS_DIR, f"{task_id}.json")
+
+
+def save_progress(task_id: str, data: dict) -> None:
+    path = progress_file_path(task_id)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def load_progress(task_id: str):
+    path = progress_file_path(task_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 
 # ====== 登录相关 ======
 def is_logged_in() -> bool:
     return bool(session.get("logged_in"))
 
+
 def login_required(view_func):
-    """简单的登录保护装饰器。未登录时跳转到 /login"""
     from functools import wraps
+
     @wraps(view_func)
     def wrapper(*args, **kwargs):
         if not is_logged_in():
-            # 对 API（JSON/SSE）来说，直接返回 401 更合适
-            if request.path.startswith("/start") or request.path.startswith("/progress") or request.path.startswith("/download_final"):
-                # 返回 JSON 错误（SSE 的话前端会触发 onerror）
+            if request.path.startswith(("/start", "/progress", "/download_final")):
                 return jsonify({"error": "unauthorized"}), 401
-            # 普通页面跳登录页
             return redirect(url_for("login", next=request.path))
         return view_func(*args, **kwargs)
+
     return wrapper
+
 
 LOGIN_PAGE = r"""
 <!doctype html>
@@ -164,19 +192,16 @@ button:hover{background:#0069d9}
     <input id="username" name="username" required autocomplete="username">
     <label for="password">密码</label>
     <input id="password" type="password" name="password" required autocomplete="current-password">
-    {% if error %}
-    <div class="error">{{ error }}</div>
-    {% endif %}
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
     <button type="submit">登录</button>
-    {% if next_path %}
-    <input type="hidden" name="next" value="{{ next_path }}">
-    {% endif %}
+    {% if next_path %}<input type="hidden" name="next" value="{{ next_path }}">{% endif %}
   </form>
   <div class="tip">账号密码由管理员通过环境变量配置。</div>
 </div>
 </body>
 </html>
 """
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -188,42 +213,48 @@ def login():
         if username == APP_USERNAME and password == APP_PASSWORD:
             session["logged_in"] = True
             return redirect(next_path or "/")
-        else:
-            error = "账号或密码错误"
+        error = "账号或密码错误"
     return render_template_string(LOGIN_PAGE, error=error, next_path=next_path)
+
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
 
+
 # ====== 下载工作线程 ======
-def download_worker(urls, q: queue.Queue, task_id: str):
-    """
-    异步下载所有 URL，实时将 items（每张图片的 name/status/progress）放入队列推送给前端。
-    最后在 tmp_zip/<task_id>.zip 写入打包结果并发送 done=True。
-    """
-    items = []  # 每个元素: {"name": filename, "status": "...", "progress": 0..100}
+def download_worker(urls, task_id: str, skipped_names=None):
+    skipped_names = skipped_names or []
+    items = []
     zip_buffer = BytesIO()
 
-    with ZipFile(zip_buffer, "w") as zf:
-        for i, url in enumerate(urls, start=1):
-            filename = extract_filename_from_url(url)
-            # 如果有重复名字，添加序号避免覆盖
-            base, ext = os.path.splitext(filename)
-            unique_name = filename
-            suffix = 1
-            while any(it["name"] == unique_name for it in items):
-                unique_name = f"{base}_{suffix}{ext}"
-                suffix += 1
+    def push(done=False, message=""):
+        save_progress(task_id, {
+            "items": items.copy(),
+            "done": done,
+            "message": message,
+            "skipped_count": len(skipped_names),
+            "skipped_names": skipped_names[:50],
+            "updated_at": time.time(),
+        })
 
-            item = {"name": unique_name, "status": "下载中", "progress": 0}
+    first_msg = f"已按文件名去重，跳过 {len(skipped_names)} 个重复链接。" if skipped_names else "任务已开始。"
+    push(False, first_msg)
+
+    with ZipFile(zip_buffer, "w") as zf:
+        for url in urls:
+            filename = extract_filename_from_url(url)
+            item = {"name": filename, "status": "下载中", "progress": 0}
             items.append(item)
-            q.put({"items": items.copy(), "done": False})
+            push(False)
 
             try:
-                # stream 下载以便计算进度
-                with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                    "Referer": "https://parents.codmon.com/",
+                }
+                with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, headers=headers) as r:
                     r.raise_for_status()
                     total = int(r.headers.get("content-length") or 0)
                     downloaded = 0
@@ -234,82 +265,96 @@ def download_worker(urls, q: queue.Queue, task_id: str):
                         chunks.append(chunk)
                         downloaded += len(chunk)
                         if total:
-                            item["progress"] = int(downloaded * 100 / total)
+                            item["progress"] = min(99, int(downloaded * 100 / total))
                         else:
-                            item["progress"] = 100  # 无 content-length 的情况下直接置 100
-                        # 推送当前状态（浅拷贝）
-                        q.put({"items": items.copy(), "done": False})
-
+                            item["progress"] = 50
+                        push(False)
                     content_bytes = b"".join(chunks)
 
-                # 写入 ZIP（使用 unique_name）
-                zf.writestr(unique_name, content_bytes)
+                zf.writestr(filename, content_bytes)
                 item["status"] = "完成"
                 item["progress"] = 100
-                q.put({"items": items.copy(), "done": False})
+                push(False)
 
             except requests.exceptions.RequestException as e:
                 item["status"] = f"失败: {str(e)}"
                 item["progress"] = 100
-                q.put({"items": items.copy(), "done": False})
+                push(False)
             except Exception as e:
                 item["status"] = f"失败: {str(e)}"
                 item["progress"] = 100
-                q.put({"items": items.copy(), "done": False})
+                push(False)
 
-    # 写入磁盘
     zip_buffer.seek(0)
     zip_path = os.path.join(TMP_DIR, f"{task_id}.zip")
     with open(zip_path, "wb") as f:
         f.write(zip_buffer.read())
 
-    # 通知前端完成 (done=True)
-    q.put({"items": items.copy(), "done": True})
+    final_msg = f"处理完成。已跳过 {len(skipped_names)} 个重复链接。" if skipped_names else "处理完成。"
+    push(True, final_msg)
+
 
 # ====== SSE 进度流 ======
 @app.route("/progress/<task_id>")
 @login_required
 def progress_stream(task_id):
-    """
-    Server-Sent Events (SSE) 端点，前端通过 EventSource 订阅此端点来接收实时进度。
-    """
     def event_stream():
-        q = progress_queues.get(task_id)
-        if not q:
-            yield f"data: {json.dumps({'error': 'task not found'})}\n\n"
-            return
+        last_payload = None
+        not_found_wait = 0
         while True:
-            try:
-                data = q.get(timeout=0.1)
-                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-                if data.get("done"):
-                    break
-            except queue.Empty:
+            data = load_progress(task_id)
+            if data is None:
+                not_found_wait += 1
+                if not_found_wait > 50:
+                    yield f"data: {json.dumps({'error': 'task not found'}, ensure_ascii=False)}\n\n"
+                    return
+                time.sleep(0.1)
                 continue
 
-    return Response(event_stream(), mimetype="text/event-stream")
+            payload = json.dumps(data, ensure_ascii=False)
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+
+            if data.get("done"):
+                break
+            time.sleep(0.3)
+
+    return Response(event_stream(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+
 
 # ====== 启动任务 ======
 @app.route("/start", methods=["POST"])
 @login_required
 def start():
-    """
-    接受 JSON: {"urls": "url1\nurl2\nurl3"} ，返回 {"task_id": "..."}。
-    """
     payload = request.get_json(force=True)
     raw = payload.get("urls", "")
     urls = [u.strip() for u in raw.splitlines() if u.strip()]
     if not urls:
         return jsonify({"error": "no urls provided"}), 400
 
-    task_id = str(uuid.uuid4())
-    q = queue.Queue()
-    progress_queues[task_id] = q
+    unique_urls, skipped_names = dedupe_urls_by_filename(urls)
+    if not unique_urls:
+        return jsonify({"error": "all urls were duplicates or invalid"}), 400
 
-    thread = threading.Thread(target=download_worker, args=(urls, q, task_id), daemon=True)
+    task_id = str(uuid.uuid4())
+    save_progress(task_id, {
+        "items": [],
+        "done": False,
+        "message": f"已按文件名去重，跳过 {len(skipped_names)} 个重复链接。" if skipped_names else "任务已创建。",
+        "skipped_count": len(skipped_names),
+        "skipped_names": skipped_names[:50],
+        "updated_at": time.time(),
+    })
+
+    thread = threading.Thread(target=download_worker, args=(unique_urls, task_id, skipped_names), daemon=True)
     thread.start()
 
-    return jsonify({"task_id": task_id})
+    return jsonify({"task_id": task_id, "skipped_count": len(skipped_names)})
+
 
 # ====== 下载最终 ZIP ======
 @app.route("/download_final/<task_id>")
@@ -318,9 +363,10 @@ def download_final(task_id):
     zip_path = os.path.join(TMP_DIR, f"{task_id}.zip")
     if not os.path.exists(zip_path):
         return "File not found", 404
-    return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name="images.zip")
+    return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name="codmon_images.zip")
 
-# ====== 主界面（内嵌前端） ======
+
+# ====== 主界面 ======
 HTML_PAGE = r"""
 <!doctype html>
 <html lang="zh-CN">
@@ -332,38 +378,24 @@ body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#f7f7f7}
 .container{max-width:900px;margin:0 auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
 textarea,input{width:100%;padding:8px;margin:6px 0;border:1px solid #ddd;border-radius:6px;box-sizing:border-box}
 button{padding:10px 16px;background:#007bff;color:#fff;border:none;border-radius:6px;cursor:pointer}
-button:hover{background:#0069d9}
-.progress{width:100%;height:18px;background:#eee;border-radius:9px;overflow:hidden;margin-top:8px}
-.bar{height:100%;width:0;background:#4caf50}
-.log{background:#fafafa;border:1px solid #eee;padding:10px;border-radius:6px;max-height:360px;overflow:auto}
-.item{padding:6px 0;border-bottom:1px dashed #eee}
-.status-ok{color:green}
-.status-fail{color:#e53935}
-.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-.topbar a{font-size:14px;color:#007bff;text-decoration:none}
-.topbar a:hover{text-decoration:underline}
+button:hover{background:#0069d9}.progress{width:100%;height:18px;background:#eee;border-radius:9px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:#4caf50}
+.log{background:#fafafa;border:1px solid #eee;padding:10px;border-radius:6px;max-height:360px;overflow:auto}.item{padding:6px 0;border-bottom:1px dashed #eee}.status-ok{color:green}.status-fail{color:#e53935}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}.topbar a{font-size:14px;color:#007bff;text-decoration:none}.topbar a:hover{text-decoration:underline}
+.small{font-size:13px;color:#666}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="topbar">
-    <h2>图片批量下载器（ZIP）</h2>
-    <a href="/logout">退出登录</a>
-  </div>
-  <p><a href="https://parents.codmon.com/site/organizations" target="_blank" rel="noopener noreferrer">parents.codmon.com</a></p>
-  <p>粘贴图片 URL（每行一个），点击“开始下载”。文件名自动从 URL 提取（例如 <code>A7V08093.jpg</code>）。</p>
+  <div class="topbar"><h2>图片批量下载器（ZIP）</h2><a href="/logout">退出登录</a></div>
+  <p><a href="https://parents.codmon.com/" target="_blank" rel="noopener noreferrer">parents.codmon.com</a></p>
+  <p>粘贴图片 URL（每行一个），点击“开始下载”。文件名自动从 URL 提取，例如 <code>A7V08093.jpg</code>、<code>128361306-IMG_6495.jpeg</code>。同名会自动去重，只保留第一张。</p>
 
   <label for="urls">图片 URL（每行一个）</label>
   <textarea id="urls" rows="10" placeholder="https://image.codmon.com/codmon/13774/albums/A7V08093.jpg?Policy=...
-https://image.codmon.com/codmon/13774/albums/A7V08094.jpeg?Policy=...
-https://image.codmon.com/codmon/13774/albums/A7V08095.png?Policy=..."></textarea>
+https://image.codmon.com/codmon/13774/documentations/113598/128361306-IMG_6495.jpeg?Policy=..."></textarea>
 
   <button id="startBtn">开始下载</button>
-
-  <div class="progress" style="margin-top:12px;">
-    <div id="bar" class="bar"></div>
-  </div>
-
+  <div class="progress" style="margin-top:12px;"><div id="bar" class="bar"></div></div>
   <h3 style="margin-top:14px">进度 / 日志</h3>
   <div id="log" class="log"></div>
 </div>
@@ -377,15 +409,15 @@ function appendLog(html) {
   log.insertAdjacentHTML("beforeend", html + "<br>");
   log.scrollTop = log.scrollHeight;
 }
-
 function resetUI() {
   document.getElementById("bar").style.width = "0%";
   document.getElementById("log").innerHTML = "";
-  if (es) {
-    es.close();
-    es = null;
-  }
+  if (es) { es.close(); es = null; }
   task_id = null;
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 }
 
 document.getElementById("startBtn").addEventListener("click", async function(){
@@ -402,28 +434,28 @@ document.getElementById("startBtn").addEventListener("click", async function(){
     });
     if (!res.ok) {
       const text = await res.text();
-      appendLog("<span class='status-fail'>提交失败: " + text + "</span>");
+      appendLog("<span class='status-fail'>提交失败: " + escapeHtml(text) + "</span>");
       return;
     }
     const data = await res.json();
     if (data.error) {
-      appendLog("<span class='status-fail'>提交失败: "+data.error+"</span>");
+      appendLog("<span class='status-fail'>提交失败: "+escapeHtml(data.error)+"</span>");
       return;
     }
     task_id = data.task_id;
-    appendLog("任务 ID: " + task_id);
+    appendLog("任务 ID: " + escapeHtml(task_id));
+    if (data.skipped_count) appendLog("♻️ 已按文件名去重，跳过 " + data.skipped_count + " 个重复链接");
   } catch (e) {
-    appendLog("<span class='status-fail'>提交请求出错: "+e+"</span>");
+    appendLog("<span class='status-fail'>提交请求出错: "+escapeHtml(e)+"</span>");
     return;
   }
 
-  // 订阅 SSE
   es = new EventSource("/progress/" + task_id);
   es.onmessage = function(e){
     try {
       const msg = JSON.parse(e.data);
       if (msg.error) {
-        appendLog("<span class='status-fail'>错误: "+msg.error+"</span>");
+        appendLog("<span class='status-fail'>错误: "+escapeHtml(msg.error)+"</span>");
         es.close();
         return;
       }
@@ -431,13 +463,17 @@ document.getElementById("startBtn").addEventListener("click", async function(){
       const done = !!msg.done;
       const logDiv = document.getElementById("log");
       logDiv.innerHTML = "";
+
+      if (msg.message) logDiv.insertAdjacentHTML("beforeend", "<div class='item small'>" + escapeHtml(msg.message) + "</div>");
+      if (msg.skipped_count) logDiv.insertAdjacentHTML("beforeend", "<div class='item small'>♻️ 去重跳过：" + msg.skipped_count + " 个重复文件名</div>");
+
       let totalProgress = 0;
       items.forEach(function(it){
         totalProgress += (it.progress || 0);
         const cls = (it.status && it.status.startsWith("完成")) ? "status-ok" :
                     (it.status && it.status.startsWith("失败")) ? "status-fail" : "";
         logDiv.insertAdjacentHTML("beforeend",
-          "<div class='item'><b>"+it.name+"</b> - <span class='"+cls+"'>"+(it.status||"")+
+          "<div class='item'><b>"+escapeHtml(it.name)+"</b> - <span class='"+cls+"'>"+escapeHtml(it.status||"")+
           "</span> ("+(it.progress||0)+"%)</div>");
       });
       if (items.length) {
@@ -445,10 +481,10 @@ document.getElementById("startBtn").addEventListener("click", async function(){
         document.getElementById("bar").style.width = percent + "%";
       }
       if (done) {
-        appendLog("✅ 所有文件已处理，准备打包并提供下载...");
+        appendLog("✅ 所有文件已处理，准备下载 ZIP...");
         const a = document.createElement("a");
         a.href = "/download_final/" + task_id;
-        a.download = "images.zip";
+        a.download = "codmon_images.zip";
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -468,32 +504,38 @@ document.getElementById("startBtn").addEventListener("click", async function(){
 </html>
 """
 
+
 @app.route("/")
 @login_required
 def index():
     return render_template_string(HTML_PAGE)
+
 
 # ====== 自动清理线程 ======
 def cleanup_zip_files():
     while True:
         now = time.time()
         try:
-            for fname in os.listdir(TMP_DIR):
-                full = os.path.join(TMP_DIR, fname)
-                if not os.path.isfile(full):
+            for folder in (TMP_DIR, PROGRESS_DIR):
+                if not os.path.isdir(folder):
                     continue
-                if now - os.path.getmtime(full) > ZIP_TTL_SECONDS:
-                    try:
-                        os.remove(full)
-                    except Exception:
-                        pass
+                for fname in os.listdir(folder):
+                    full = os.path.join(folder, fname)
+                    if not os.path.isfile(full):
+                        continue
+                    if now - os.path.getmtime(full) > ZIP_TTL_SECONDS:
+                        try:
+                            os.remove(full)
+                        except Exception:
+                            pass
         except Exception:
             pass
         time.sleep(CLEANUP_INTERVAL)
 
+
 threading.Thread(target=cleanup_zip_files, daemon=True).start()
 
-# ====== 启动 ======
+
 if __name__ == "__main__":
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", "5000"))
